@@ -72,15 +72,24 @@ impl App {
     }
 
     fn refresh(&mut self) -> io::Result<()> {
-        let groups = gather_groups()?;
-        self.groups = groups;
-        self.last_updated = SystemTime::now();
-        self.message = None;
-        Ok(())
-    }
-
-    fn set_error(&mut self, err: io::Error) {
-        self.message = Some(format!("refresh failed: {err}"));
+        match gather_groups() {
+            Ok(groups) => {
+                self.last_updated = SystemTime::now();
+                if groups.is_empty() && !self.groups.is_empty() {
+                    // Keep the previous snapshot and surface a hint instead of flickering to empty.
+                    self.message =
+                        Some("no matching processes right now; showing previous snapshot".into());
+                } else {
+                    self.groups = groups;
+                    self.message = None;
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.message = Some(format!("refresh failed: {err}"));
+                Err(err)
+            }
+        }
     }
 
     fn status_line(&self) -> String {
@@ -154,10 +163,7 @@ fn run_tui() -> io::Result<()> {
         }
 
         if last_tick.elapsed() >= REFRESH_INTERVAL {
-            match app.refresh() {
-                Ok(_) => {}
-                Err(err) => app.set_error(err),
-            }
+            let _ = app.refresh();
             last_tick = Instant::now();
         }
     };
@@ -446,6 +452,9 @@ fn group_by_directory(
             Some(path) => shorten_path(path, home_dir.as_deref()),
             None => continue,
         };
+        if key == "~" {
+            continue;
+        }
         groups.entry(key).or_default().push(process);
     }
 
