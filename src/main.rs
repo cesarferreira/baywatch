@@ -1,4 +1,16 @@
+use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame,
+    prelude::*,
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -6,8 +18,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
-use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LSOF_CHUNK_SIZE: usize = 40;
@@ -34,18 +45,50 @@ enum Command {
     },
 }
 
-#[derive(Copy, Clone)]
-enum ViewMode {
-    Live,
-    Snapshot,
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct ProcessInfo {
     pid: u32,
     user: String,
     command_line: String,
     cwd: Option<String>,
+}
+
+type GroupedProcesses = BTreeMap<String, Vec<ProcessInfo>>;
+
+struct App {
+    groups: GroupedProcesses,
+    last_updated: SystemTime,
+    message: Option<String>,
+}
+
+impl App {
+    fn new() -> io::Result<Self> {
+        let groups = gather_groups()?;
+        Ok(Self {
+            groups,
+            last_updated: SystemTime::now(),
+            message: None,
+        })
+    }
+
+    fn refresh(&mut self) -> io::Result<()> {
+        let groups = gather_groups()?;
+        self.groups = groups;
+        self.last_updated = SystemTime::now();
+        self.message = None;
+        Ok(())
+    }
+
+    fn set_error(&mut self, err: io::Error) {
+        self.message = Some(format!("refresh failed: {err}"));
+    }
+
+    fn status_line(&self) -> String {
+        self.message.clone().unwrap_or_else(|| {
+            "Press q to quit • snapshot: baywatch snapshot • export: baywatch export <file>"
+                .to_string()
+        })
+    }
 }
 
 fn main() {
@@ -61,24 +104,199 @@ fn run(args: Args) -> io::Result<()> {
     match args.command {
         Some(Command::Snapshot) => {
             let groups = gather_groups()?;
-            render(&groups, ViewMode::Snapshot)?;
+            render_snapshot(&groups)?;
         }
         Some(Command::Export { path }) => {
             let groups = gather_groups()?;
             export_json(&groups, &path)?;
             println!("snapshot written to {}", path.display());
         }
-        None => run_live()?,
+        None => run_tui()?,
     }
 
     Ok(())
 }
 
-fn run_live() -> io::Result<()> {
-    loop {
-        let groups = gather_groups()?;
-        render(&groups, ViewMode::Live)?;
-        thread::sleep(REFRESH_INTERVAL);
+fn run_tui() -> io::Result<()> {
+    let mut app = App::new()?;
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let mut last_tick = Instant::now();
+
+    let result: io::Result<()> = loop {
+        terminal.draw(|frame| draw(frame, &app))?;
+
+        let timeout = REFRESH_INTERVAL
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or_else(|| Duration::from_millis(0));
+
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    let is_ctrl_c = key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL);
+                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) || is_ctrl_c {
+                        break Ok(());
+                    }
+                }
+                Event::Resize(_, _) => {
+                    // trigger redraw immediately on resize
+                    terminal.draw(|frame| draw(frame, &app))?;
+                }
+                _ => {}
+            }
+        }
+
+        if last_tick.elapsed() >= REFRESH_INTERVAL {
+            match app.refresh() {
+                Ok(_) => {}
+                Err(err) => app.set_error(err),
+            }
+            last_tick = Instant::now();
+        }
+    };
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn draw(frame: &mut Frame, app: &App) {
+    let size = frame.size();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+        .split(size);
+
+    let header_lines = vec![
+        Line::from(Span::styled(
+            "baywatch",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "tracking {} workspace{}",
+            app.groups.len(),
+            if app.groups.len() == 1 { "" } else { "s" }
+        )),
+        Line::from(format!(
+            "last refresh {}",
+            format_timestamp(app.last_updated)
+        )),
+    ];
+
+    let header = Paragraph::new(header_lines)
+        .alignment(Alignment::Left)
+        .block(Block::default().title("Overview").borders(Borders::ALL));
+    frame.render_widget(header, chunks[0]);
+
+    let items = build_process_items(&app.groups);
+    let list_block = Block::default()
+        .title("Active directories")
+        .borders(Borders::ALL);
+
+    if items.is_empty() {
+        let empty = Paragraph::new("No processes found for current user.")
+            .alignment(Alignment::Center)
+            .block(list_block);
+        frame.render_widget(empty, chunks[1]);
+    } else {
+        let list = List::new(items).block(list_block);
+        frame.render_widget(list, chunks[1]);
+    }
+
+    let status_line = app.status_line();
+    let status = Paragraph::new(status_line)
+        .alignment(Alignment::Left)
+        .block(Block::default().borders(Borders::ALL).title("Status"));
+    frame.render_widget(status, chunks[2]);
+}
+
+fn build_process_items(groups: &GroupedProcesses) -> Vec<ListItem<'static>> {
+    let mut items = Vec::new();
+    let mut first_group = true;
+
+    for (directory, processes) in groups {
+        if !first_group {
+            items.push(ListItem::new(Line::from("")));
+        }
+        first_group = false;
+
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            directory.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )])));
+
+        for process in processes {
+            let pid_span = Span::styled(
+                format!("[{}]", process.pid),
+                Style::default().fg(Color::LightBlue),
+            );
+            let user_span = Span::styled(process.user.clone(), Style::default().fg(Color::Green));
+            let command_span = Span::raw(process.command_line.clone());
+
+            let line = Line::from(vec![
+                Span::raw("  "),
+                pid_span,
+                Span::raw(" "),
+                user_span,
+                Span::raw(": "),
+                command_span,
+            ]);
+            items.push(ListItem::new(line));
+        }
+    }
+
+    items
+}
+
+fn format_timestamp(time: SystemTime) -> String {
+    let date_time: DateTime<Local> = time.into();
+    let absolute = date_time.format("%Y-%m-%d %H:%M:%S").to_string();
+    let relative = format_relative(time);
+    format!("{absolute} ({relative})")
+}
+
+fn format_relative(time: SystemTime) -> String {
+    match SystemTime::now().duration_since(time) {
+        Ok(duration) => {
+            if duration < Duration::from_secs(1) {
+                "just now".to_string()
+            } else if duration < Duration::from_secs(60) {
+                format!("{}s ago", duration.as_secs())
+            } else if duration < Duration::from_secs(3600) {
+                let minutes = duration.as_secs() / 60;
+                format!("{minutes}m ago")
+            } else if duration < Duration::from_secs(86_400) {
+                let hours = duration.as_secs() / 3600;
+                let minutes = (duration.as_secs() % 3600) / 60;
+                if minutes == 0 {
+                    format!("{hours}h ago")
+                } else {
+                    format!("{hours}h {minutes}m ago")
+                }
+            } else {
+                let days = duration.as_secs() / 86_400;
+                format!("{days}d ago")
+            }
+        }
+        Err(_) => "in the future".to_string(),
     }
 }
 
@@ -288,31 +506,19 @@ fn export_json(groups: &BTreeMap<String, Vec<ProcessInfo>>, path: &Path) -> io::
     file.flush()
 }
 
-fn render(groups: &BTreeMap<String, Vec<ProcessInfo>>, mode: ViewMode) -> io::Result<()> {
+fn render_snapshot(groups: &BTreeMap<String, Vec<ProcessInfo>>) -> io::Result<()> {
     let mut stdout = io::stdout();
-    if matches!(mode, ViewMode::Live) {
-        // Clear screen and move cursor to top-left.
-        write!(stdout, "\u{001b}[2J\u{001b}[H")?;
-    }
+    let timestamp = format_timestamp(SystemTime::now());
 
-    let now = SystemTime::now();
-    let timestamp = match now.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => {
-            let secs = duration.as_secs();
-            format!("{secs}")
-        }
-        Err(_) => String::from("unknown"),
-    };
-
-    writeln!(stdout, "baywatch — grouping processes by working directory")?;
-    match mode {
-        ViewMode::Live => writeln!(stdout, "updated at {timestamp}; press Ctrl+C to exit")?,
-        ViewMode::Snapshot => writeln!(stdout, "snapshot at {timestamp}")?,
-    }
+    writeln!(
+        stdout,
+        "baywatch snapshot — grouping processes by working directory"
+    )?;
+    writeln!(stdout, "snapshot captured {timestamp}")?;
     writeln!(stdout)?;
 
     if groups.is_empty() {
-        writeln!(stdout, "no processes found for current user")?;
+        writeln!(stdout, "no processes found for current user.")?;
         stdout.flush()?;
         return Ok(());
     }
