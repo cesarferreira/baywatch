@@ -6,10 +6,11 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use libc::{self, ESRCH, SIGTERM};
 use ratatui::{
     Frame,
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LSOF_CHUNK_SIZE: usize = 40;
 const IGNORE_PREFIXES: &[&str] = &["/Applications/", "/System/"];
+const SUPPRESS_COMMANDS: &[&str] = &["zsh", "bash", "sh", "fish", "pwsh", "powershell"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -55,48 +57,373 @@ struct ProcessInfo {
 
 type GroupedProcesses = BTreeMap<String, Vec<ProcessInfo>>;
 
+#[derive(Debug, Clone)]
+struct GroupEntry {
+    name: String,
+    processes: Vec<ProcessInfo>,
+    selected_process: Option<usize>,
+}
+
+impl GroupEntry {
+    fn new(name: String, processes: Vec<ProcessInfo>, preferred_pid: Option<u32>) -> Self {
+        let selected_process = preferred_pid
+            .and_then(|pid| processes.iter().position(|proc| proc.pid == pid))
+            .or_else(|| if !processes.is_empty() { Some(0) } else { None });
+        Self {
+            name,
+            processes,
+            selected_process,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Focus {
+    Groups,
+    Processes,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum StatusKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl StatusKind {
+    fn style(self) -> Style {
+        match self {
+            StatusKind::Info => Style::default().fg(Color::Gray),
+            StatusKind::Success => Style::default().fg(Color::LightGreen),
+            StatusKind::Warning => Style::default().fg(Color::Yellow),
+            StatusKind::Error => Style::default().fg(Color::LightRed),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StatusMessage {
+    text: String,
+    kind: StatusKind,
+}
+
+impl StatusMessage {
+    fn new(kind: StatusKind, text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind,
+        }
+    }
+}
+
 struct App {
-    groups: GroupedProcesses,
+    groups: Vec<GroupEntry>,
     last_updated: SystemTime,
-    message: Option<String>,
+    status: Option<StatusMessage>,
+    focus: Focus,
+    selected_group: usize,
 }
 
 impl App {
     fn new() -> io::Result<Self> {
-        let groups = gather_groups()?;
-        Ok(Self {
-            groups,
+        let mut app = Self {
+            groups: Vec::new(),
             last_updated: SystemTime::now(),
-            message: None,
-        })
+            status: None,
+            focus: Focus::Groups,
+            selected_group: 0,
+        };
+
+        let initial_groups = gather_groups()?;
+        app.replace_groups(initial_groups);
+        if app.groups.is_empty() {
+            app.status = Some(StatusMessage::new(
+                StatusKind::Info,
+                "no matching processes",
+            ));
+        }
+        Ok(app)
     }
 
     fn refresh(&mut self) -> io::Result<()> {
         match gather_groups() {
             Ok(groups) => {
                 self.last_updated = SystemTime::now();
-                if groups.is_empty() && !self.groups.is_empty() {
-                    // Keep the previous snapshot and surface a hint instead of flickering to empty.
-                    self.message =
-                        Some("no matching processes right now; showing previous snapshot".into());
-                } else {
-                    self.groups = groups;
-                    self.message = None;
+                if groups.is_empty() {
+                    if self.groups.is_empty() {
+                        self.set_status(StatusKind::Info, "no matching processes");
+                    } else {
+                        self.set_status(
+                            StatusKind::Warning,
+                            "no matching processes right now; showing previous snapshot",
+                        );
+                    }
+                    return Ok(());
                 }
+
+                self.replace_groups(groups);
+                self.clear_warning();
                 Ok(())
             }
             Err(err) => {
-                self.message = Some(format!("refresh failed: {err}"));
+                self.set_status(StatusKind::Error, format!("refresh failed: {err}"));
                 Err(err)
             }
         }
     }
 
-    fn status_line(&self) -> String {
-        self.message.clone().unwrap_or_else(|| {
-            "Press q to quit • snapshot: baywatch snapshot • export: baywatch export <file>"
-                .to_string()
-        })
+    fn replace_groups(&mut self, map: GroupedProcesses) {
+        let preferred: HashMap<String, Option<u32>> = self
+            .groups
+            .iter()
+            .map(|group| {
+                let pid = group
+                    .selected_process
+                    .and_then(|idx| group.processes.get(idx))
+                    .map(|proc| proc.pid);
+                (group.name.clone(), pid)
+            })
+            .collect();
+
+        let previous_selection = self.selected_group_name().map(|name| name.to_string());
+
+        let mut new_groups = Vec::new();
+        for (name, processes) in map.into_iter() {
+            let preferred_pid = preferred.get(&name).copied().flatten();
+            new_groups.push(GroupEntry::new(name, processes, preferred_pid));
+        }
+
+        if new_groups.is_empty() {
+            self.selected_group = 0;
+        } else if let Some(name) = previous_selection {
+            if let Some(index) = new_groups.iter().position(|g| g.name == name) {
+                self.selected_group = index;
+            } else {
+                self.selected_group = self.selected_group.min(new_groups.len() - 1);
+            }
+        } else {
+            self.selected_group = self.selected_group.min(new_groups.len() - 1);
+        }
+
+        self.groups = new_groups;
+        self.ensure_focus_valid();
+    }
+
+    fn ensure_focus_valid(&mut self) {
+        if self.groups.is_empty() {
+            self.focus = Focus::Groups;
+            self.selected_group = 0;
+            return;
+        }
+
+        if self.selected_group >= self.groups.len() {
+            self.selected_group = self.groups.len() - 1;
+        }
+
+        if matches!(self.focus, Focus::Processes)
+            && self.groups[self.selected_group].selected_process.is_none()
+        {
+            self.focus = Focus::Groups;
+        }
+    }
+
+    fn selected_group_name(&self) -> Option<&str> {
+        self.groups
+            .get(self.selected_group)
+            .map(|group| group.name.as_str())
+    }
+
+    fn move_focus(&mut self, delta: isize) {
+        match self.focus {
+            Focus::Groups => self.move_group(delta),
+            Focus::Processes => self.move_process(delta),
+        }
+    }
+
+    fn move_group(&mut self, delta: isize) {
+        if self.groups.is_empty() {
+            return;
+        }
+        let len = self.groups.len() as isize;
+        let mut index = self.selected_group as isize + delta;
+        index = index.clamp(0, len - 1);
+        self.selected_group = index as usize;
+        if let Some(group) = self.groups.get_mut(self.selected_group) {
+            if group.selected_process.is_none() && !group.processes.is_empty() {
+                group.selected_process = Some(0);
+            }
+        }
+    }
+
+    fn move_process(&mut self, delta: isize) {
+        if let Some(group) = self.groups.get_mut(self.selected_group) {
+            if group.processes.is_empty() {
+                return;
+            }
+            let len = group.processes.len() as isize;
+            let current = group.selected_process.unwrap_or(0) as isize;
+            let mut index = current + delta;
+            index = index.clamp(0, len - 1);
+            group.selected_process = Some(index as usize);
+        }
+    }
+
+    fn focus_groups(&mut self) {
+        self.focus = Focus::Groups;
+    }
+
+    fn focus_processes(&mut self) {
+        if self.groups.is_empty() {
+            self.set_status(StatusKind::Info, "no projects to focus on");
+            return;
+        }
+        if self.groups[self.selected_group].processes.is_empty() {
+            let name = self.groups[self.selected_group].name.clone();
+            self.set_status(StatusKind::Info, format!("{name} has no visible processes"));
+            return;
+        }
+        if let Some(group) = self.groups.get_mut(self.selected_group) {
+            if group.selected_process.is_none() {
+                group.selected_process = Some(0);
+            }
+        }
+        self.focus = Focus::Processes;
+    }
+
+    fn toggle_focus(&mut self) {
+        match self.focus {
+            Focus::Groups => self.focus_processes(),
+            Focus::Processes => self.focus_groups(),
+        }
+    }
+
+    fn to_group_map(&self) -> GroupedProcesses {
+        let mut map = BTreeMap::new();
+        for group in &self.groups {
+            map.insert(group.name.clone(), group.processes.clone());
+        }
+        map
+    }
+
+    fn selected_process_details(&self) -> Option<(String, ProcessInfo)> {
+        let group = self.groups.get(self.selected_group)?;
+        let index = group.selected_process?;
+        group
+            .processes
+            .get(index)
+            .cloned()
+            .map(|process| (group.name.clone(), process))
+    }
+
+    fn kill_selected_process(&mut self) {
+        if !matches!(self.focus, Focus::Processes) {
+            self.set_status(
+                StatusKind::Info,
+                "focus the process pane (Tab) to terminate a process",
+            );
+            return;
+        }
+
+        let Some((directory, process)) = self.selected_process_details() else {
+            self.set_status(StatusKind::Info, "no process selected");
+            return;
+        };
+
+        match terminate_process(process.pid) {
+            Ok(()) => {
+                self.set_status(
+                    StatusKind::Success,
+                    format!("sent SIGTERM to {} ({})", process.pid, process.command_line),
+                );
+                let _ = self.refresh();
+            }
+            Err(err) => {
+                self.set_status(
+                    StatusKind::Error,
+                    format!("failed to kill {} in {}: {err}", process.pid, directory),
+                );
+            }
+        }
+    }
+
+    fn kill_selected_group(&mut self) {
+        if self.groups.is_empty() {
+            self.set_status(StatusKind::Info, "no projects to terminate");
+            return;
+        }
+        let group_name = self.groups[self.selected_group].name.clone();
+        let processes = self.groups[self.selected_group].processes.clone();
+
+        if processes.is_empty() {
+            self.set_status(
+                StatusKind::Info,
+                format!("{group_name} has no visible processes"),
+            );
+            return;
+        }
+
+        let mut successes = 0usize;
+        let mut failures: Vec<(u32, io::Error)> = Vec::new();
+
+        for process in &processes {
+            match terminate_process(process.pid) {
+                Ok(()) => successes += 1,
+                Err(err) => failures.push((process.pid, err)),
+            }
+        }
+
+        if failures.is_empty() {
+            self.set_status(
+                StatusKind::Success,
+                format!(
+                    "terminated {} process{} in {}",
+                    successes,
+                    if successes == 1 { "" } else { "es" },
+                    group_name
+                ),
+            );
+            let _ = self.refresh();
+        } else {
+            let (pid, err) = &failures[0];
+            self.set_status(
+                StatusKind::Error,
+                format!(
+                    "partial kill: {} failure(s), first failure on {}: {err}",
+                    failures.len(),
+                    pid
+                ),
+            );
+        }
+    }
+
+    fn write_snapshot_file(&self) -> io::Result<PathBuf> {
+        let map = self.to_group_map();
+        let path = timestamped_path("baywatch", "txt");
+        let mut file = File::create(&path)?;
+        render_snapshot(&mut file, &map)?;
+        file.flush()?;
+        Ok(path)
+    }
+
+    fn write_export_file(&self) -> io::Result<PathBuf> {
+        let map = self.to_group_map();
+        let path = timestamped_path("baywatch", "json");
+        export_json(&map, &path)?;
+        Ok(path)
+    }
+
+    fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
+        self.status = Some(StatusMessage::new(kind, text));
+    }
+
+    fn clear_warning(&mut self) {
+        if matches!(
+            self.status.as_ref().map(|status| status.kind),
+            Some(StatusKind::Warning)
+        ) {
+            self.status = None;
+        }
     }
 }
 
@@ -113,17 +440,18 @@ fn run(args: Args) -> io::Result<()> {
     match args.command {
         Some(Command::Snapshot) => {
             let groups = gather_groups()?;
-            render_snapshot(&groups)?;
+            let mut stdout = io::stdout();
+            render_snapshot(&mut stdout, &groups)?;
+            stdout.flush()
         }
         Some(Command::Export { path }) => {
             let groups = gather_groups()?;
             export_json(&groups, &path)?;
             println!("snapshot written to {}", path.display());
+            Ok(())
         }
-        None => run_tui()?,
+        None => run_tui(),
     }
-
-    Ok(())
 }
 
 fn run_tui() -> io::Result<()> {
@@ -148,14 +476,46 @@ fn run_tui() -> io::Result<()> {
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
-                    let is_ctrl_c = key.code == KeyCode::Char('c')
+                    let ctrl_c = key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL);
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) || is_ctrl_c {
+                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) || ctrl_c {
                         break Ok(());
+                    }
+
+                    match key.code {
+                        KeyCode::Tab => app.toggle_focus(),
+                        KeyCode::Left | KeyCode::Char('h') => app.focus_groups(),
+                        KeyCode::Right | KeyCode::Char('l') => app.focus_processes(),
+                        KeyCode::Up | KeyCode::Char('k') => app.move_focus(-1),
+                        KeyCode::Down | KeyCode::Char('j') => app.move_focus(1),
+                        KeyCode::Char('s') => match app.write_snapshot_file() {
+                            Ok(path) => app.set_status(
+                                StatusKind::Success,
+                                format!("snapshot saved to {}", path.display()),
+                            ),
+                            Err(err) => {
+                                app.set_status(StatusKind::Error, format!("snapshot failed: {err}"))
+                            }
+                        },
+                        KeyCode::Char('e') => match app.write_export_file() {
+                            Ok(path) => app.set_status(
+                                StatusKind::Success,
+                                format!("exported JSON to {}", path.display()),
+                            ),
+                            Err(err) => {
+                                app.set_status(StatusKind::Error, format!("export failed: {err}"))
+                            }
+                        },
+                        KeyCode::Char('x') => app.kill_selected_process(),
+                        KeyCode::Char('X') => app.kill_selected_group(),
+                        KeyCode::Char('r') => {
+                            let _ = app.refresh();
+                            app.set_status(StatusKind::Info, "manual refresh requested");
+                        }
+                        _ => {}
                     }
                 }
                 Event::Resize(_, _) => {
-                    // trigger redraw immediately on resize
                     terminal.draw(|frame| draw(frame, &app))?;
                 }
                 _ => {}
@@ -181,95 +541,211 @@ fn draw(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(3),
         ])
         .split(size);
 
-    let header_lines = vec![
-        Line::from(Span::styled(
-            "baywatch",
+    let workspace_count = app.groups.len();
+    let overview_line = Line::from(vec![
+        Span::styled(
+            "baywatch ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "• {} workspace{}",
+            workspace_count,
+            if workspace_count == 1 { "" } else { "s" }
         )),
-        Line::from(format!(
-            "tracking {} workspace{}",
-            app.groups.len(),
-            if app.groups.len() == 1 { "" } else { "s" }
-        )),
-        Line::from(format!(
-            "last refresh {}",
-            format_timestamp(app.last_updated)
-        )),
-    ];
+        Span::raw(" • last refresh "),
+        Span::styled(
+            format_timestamp(app.last_updated),
+            Style::default().fg(Color::LightGreen),
+        ),
+    ]);
 
-    let header = Paragraph::new(header_lines)
+    let header = Paragraph::new(overview_line)
         .alignment(Alignment::Left)
         .block(Block::default().title("Overview").borders(Borders::ALL));
     frame.render_widget(header, chunks[0]);
 
-    let items = build_process_items(&app.groups);
-    let list_block = Block::default()
-        .title("Active directories")
-        .borders(Borders::ALL);
-
-    if items.is_empty() {
-        let empty = Paragraph::new("No processes found for current user.")
+    if app.groups.is_empty() {
+        let placeholder = Paragraph::new("No processes found for current user.")
             .alignment(Alignment::Center)
-            .block(list_block);
-        frame.render_widget(empty, chunks[1]);
+            .block(
+                Block::default()
+                    .title("Active directories")
+                    .borders(Borders::ALL),
+            );
+        frame.render_widget(placeholder, chunks[1]);
     } else {
-        let list = List::new(items).block(list_block);
-        frame.render_widget(list, chunks[1]);
+        let body_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(chunks[1]);
+
+        let directory_items = build_directory_items(app);
+        let mut directory_state = ListState::default();
+        directory_state.select(Some(app.selected_group));
+
+        let directory_block = Block::default()
+            .title("Projects")
+            .borders(Borders::ALL)
+            .border_style(if matches!(app.focus, Focus::Groups) {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            });
+
+        let directory_list = List::new(directory_items)
+            .block(directory_block)
+            .highlight_style(
+                Style::default()
+                    .bg(if matches!(app.focus, Focus::Groups) {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    })
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("» ");
+
+        frame.render_stateful_widget(directory_list, body_chunks[0], &mut directory_state);
+
+        if let Some(group) = app.groups.get(app.selected_group) {
+            if group.processes.is_empty() {
+                let empty = Paragraph::new("No visible processes in this project.")
+                    .alignment(Alignment::Center)
+                    .block(
+                        Block::default()
+                            .title(format!("Processes in {}", group.name))
+                            .borders(Borders::ALL),
+                    );
+                frame.render_widget(empty, body_chunks[1]);
+            } else {
+                let process_items = build_process_items(group);
+                let mut process_state = ListState::default();
+                process_state.select(group.selected_process);
+
+                let process_block = Block::default()
+                    .title(format!("Processes in {}", group.name))
+                    .borders(Borders::ALL)
+                    .border_style(if matches!(app.focus, Focus::Processes) {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    });
+
+                let process_list = List::new(process_items)
+                    .block(process_block)
+                    .highlight_style(
+                        Style::default()
+                            .bg(if matches!(app.focus, Focus::Processes) {
+                                Color::LightBlue
+                            } else {
+                                Color::DarkGray
+                            })
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("› ");
+
+                frame.render_stateful_widget(process_list, body_chunks[1], &mut process_state);
+            }
+        }
     }
 
-    let status_line = app.status_line();
-    let status = Paragraph::new(status_line)
-        .alignment(Alignment::Left)
-        .block(Block::default().borders(Borders::ALL).title("Status"));
+    let status = build_status_bar(app);
     frame.render_widget(status, chunks[2]);
 }
 
-fn build_process_items(groups: &GroupedProcesses) -> Vec<ListItem<'static>> {
-    let mut items = Vec::new();
-    let mut first_group = true;
+fn build_directory_items(app: &App) -> Vec<ListItem<'static>> {
+    app.groups
+        .iter()
+        .map(|group| {
+            let mut spans = Vec::new();
+            spans.push(Span::styled(
+                group.name.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("({})", group.processes.len()),
+                Style::default().fg(Color::Gray),
+            ));
+            ListItem::new(Line::from(spans))
+        })
+        .collect()
+}
 
-    for (directory, processes) in groups {
-        if !first_group {
-            items.push(ListItem::new(Line::from("")));
-        }
-        first_group = false;
-
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            directory.clone(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )])));
-
-        for process in processes {
-            let pid_span = Span::styled(
-                format!("[{}]", process.pid),
-                Style::default().fg(Color::LightBlue),
-            );
-            let user_span = Span::styled(process.user.clone(), Style::default().fg(Color::Green));
-            let command_span = Span::raw(process.command_line.clone());
-
+fn build_process_items(group: &GroupEntry) -> Vec<ListItem<'static>> {
+    group
+        .processes
+        .iter()
+        .map(|process| {
             let line = Line::from(vec![
-                Span::raw("  "),
-                pid_span,
+                Span::styled(
+                    format!("[{}]", process.pid),
+                    Style::default().fg(Color::LightBlue),
+                ),
                 Span::raw(" "),
-                user_span,
-                Span::raw(": "),
-                command_span,
+                Span::styled(process.user.clone(), Style::default().fg(Color::Green)),
+                Span::raw(" - "),
+                Span::raw(process.command_line.clone()),
             ]);
-            items.push(ListItem::new(line));
+            ListItem::new(line)
+        })
+        .collect()
+}
+
+fn build_status_bar(app: &App) -> Paragraph<'static> {
+    let instructions: [(&str, &str, Color); 8] = [
+        ("q", "quit", Color::LightRed),
+        ("Tab", "focus", Color::Yellow),
+        ("←/→", "pane", Color::Yellow),
+        ("↑/↓", "move", Color::Yellow),
+        ("s", "snapshot txt", Color::LightBlue),
+        ("e", "export json", Color::LightBlue),
+        ("x", "kill process", Color::LightRed),
+        ("X", "kill project", Color::Red),
+    ];
+
+    let mut spans: Vec<Span> = Vec::new();
+    for (idx, (key, label, color)) in instructions.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("  "));
         }
+        spans.push(Span::styled(
+            *key,
+            Style::default().fg(*color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", label),
+            Style::default().fg(Color::Gray),
+        ));
     }
 
-    items
+    spans.push(Span::raw("  • focus "));
+    let focus_span = match app.focus {
+        Focus::Groups => Span::styled("projects", Style::default().fg(Color::Yellow)),
+        Focus::Processes => Span::styled("processes", Style::default().fg(Color::LightBlue)),
+    };
+    spans.push(focus_span.add_modifier(Modifier::BOLD));
+
+    if let Some(status) = &app.status {
+        spans.push(Span::raw("  • "));
+        spans.push(Span::styled(status.text.clone(), status.kind.style()));
+    }
+
+    Paragraph::new(Line::from(spans))
+        .alignment(Alignment::Left)
+        .block(Block::default().title("Status").borders(Borders::ALL))
 }
 
 fn format_timestamp(time: SystemTime) -> String {
@@ -447,6 +923,10 @@ fn group_by_directory(
     let mut groups: BTreeMap<String, Vec<ProcessInfo>> = BTreeMap::new();
 
     for process in processes {
+        if should_suppress_command(&process.command_line) {
+            continue;
+        }
+
         let key = match &process.cwd {
             Some(path) if should_ignore(path, home_dir.as_deref()) => continue,
             Some(path) => shorten_path(path, home_dir.as_deref()),
@@ -489,7 +969,6 @@ fn should_ignore(path: &str, home_dir: Option<&str>) -> bool {
         }
 
         let suffix = &path[home.len()..];
-        // Match exact ~/Library or any nested path like ~/Library/Containers/...
         if suffix.is_empty() {
             return false;
         }
@@ -500,6 +979,13 @@ fn should_ignore(path: &str, home_dir: Option<&str>) -> bool {
     }
 
     false
+}
+
+fn should_suppress_command(command_line: &str) -> bool {
+    let base = command_line.split_whitespace().next().unwrap_or("");
+    SUPPRESS_COMMANDS
+        .iter()
+        .any(|candidate| base.eq_ignore_ascii_case(candidate))
 }
 
 fn export_json(groups: &BTreeMap<String, Vec<ProcessInfo>>, path: &Path) -> io::Result<()> {
@@ -515,36 +1001,58 @@ fn export_json(groups: &BTreeMap<String, Vec<ProcessInfo>>, path: &Path) -> io::
     file.flush()
 }
 
-fn render_snapshot(groups: &BTreeMap<String, Vec<ProcessInfo>>) -> io::Result<()> {
-    let mut stdout = io::stdout();
+fn render_snapshot<W: Write>(
+    writer: &mut W,
+    groups: &BTreeMap<String, Vec<ProcessInfo>>,
+) -> io::Result<()> {
     let timestamp = format_timestamp(SystemTime::now());
 
     writeln!(
-        stdout,
+        writer,
         "baywatch snapshot — grouping processes by working directory"
     )?;
-    writeln!(stdout, "snapshot captured {timestamp}")?;
-    writeln!(stdout)?;
+    writeln!(writer, "snapshot captured {timestamp}")?;
+    writeln!(writer)?;
 
     if groups.is_empty() {
-        writeln!(stdout, "no processes found for current user.")?;
-        stdout.flush()?;
+        writeln!(writer, "no processes found for current user.")?;
+        writer.flush()?;
         return Ok(());
     }
 
     for (directory, processes) in groups {
-        writeln!(stdout, "{directory}")?;
+        writeln!(writer, "{directory}")?;
         for process in processes {
             writeln!(
-                stdout,
+                writer,
                 "    [{pid}] {user}: {cmd}",
                 pid = process.pid,
                 user = process.user,
                 cmd = process.command_line
             )?;
         }
-        writeln!(stdout)?;
+        writeln!(writer)?;
     }
 
-    stdout.flush()
+    writer.flush()
+}
+
+fn timestamped_path(prefix: &str, extension: &str) -> PathBuf {
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    PathBuf::from(format!("{prefix}-{stamp}.{extension}"))
+}
+
+fn terminate_process(pid: u32) -> io::Result<()> {
+    let pid_t = pid as libc::pid_t;
+    let result = unsafe { libc::kill(pid_t, SIGTERM) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ESRCH) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    }
 }
