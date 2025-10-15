@@ -602,16 +602,18 @@ fn draw(frame: &mut Frame, app: &App) {
 
         let directory_list = List::new(directory_items)
             .block(directory_block)
-            .highlight_style(
-                Style::default()
-                    .bg(if matches!(app.focus, Focus::Groups) {
-                        Color::Yellow
-                    } else {
-                        Color::DarkGray
-                    })
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style({
+                if matches!(app.focus, Focus::Groups) {
+                    Style::default()
+                        .bg(Color::Yellow)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD)
+                }
+            })
             .highlight_symbol("» ");
 
         frame.render_stateful_widget(directory_list, body_chunks[0], &mut directory_state);
@@ -642,16 +644,16 @@ fn draw(frame: &mut Frame, app: &App) {
 
                 let process_list = List::new(process_items)
                     .block(process_block)
-                    .highlight_style(
+                    .highlight_style(if matches!(app.focus, Focus::Processes) {
                         Style::default()
-                            .bg(if matches!(app.focus, Focus::Processes) {
-                                Color::LightBlue
-                            } else {
-                                Color::DarkGray
-                            })
+                            .bg(Color::LightBlue)
                             .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    })
                     .highlight_symbol("› ");
 
                 frame.render_stateful_widget(process_list, body_chunks[1], &mut process_state);
